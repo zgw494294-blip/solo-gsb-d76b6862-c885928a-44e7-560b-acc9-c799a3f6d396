@@ -47,6 +47,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    - 仅当两侧**均已发出且内容完全一致**时，计算「对照 − 基准」的秒数差（**正值表示对照场更晚**），其余情况显示 `—` 及原因；没有可对照的编号时页面会给出提示；
    - 切换任一场次会立即清空旧结果并重新查询，较慢的旧响应不会覆盖新结果；对照是**只读查询**，不修改档案、当前演出或版本号，任意演出状态下都可使用。
    - 档案弹窗的每个视图（列表 / 详情 / 归档表单 / 对照）都有视图序号：切换视图或关闭弹窗即作废旧视图未完成的请求，迟到的响应（无论成功、空列表还是失败）不会改写当前标题、页面、场次选择或对照结果，也不会触发默认组合查询；当前视图的加载失败仍正常显示错误。
+8. **单控制席（可选）**：默认未启用，所有页面均可写（旧行为不变）。需要多人现场防误触时，任意页面点击右上角「启用控制席」即可启用：
+   - 启用成功返回一把**随机凭据**，仅保存在**本标签页**（sessionStorage），此后该标签页的写操作自动经请求头 `X-Control-Token` 提交；其他标签页/设备变为**只读**（写按钮禁用），但仍可查看状态与档案；
+   - 其他页面可随时点「接管控制席」**主动接管**：凭当前版本号换发新凭据，**原控制席的凭据立即失效**，其后续写操作被 `403` 拒绝（即使用最新版本号也不能写）；
+   - 页头始终显示本页控制资格（未启用 / 本页 ✓ / 他人·只读），刷新页面或写请求收到 `403` 时自动更新；凭据与启用状态保存在数据库中，**跨场、刷新页面、重启服务都保留**；不提供账号、超时或关闭功能。
 
 ## 并发与一致性规则
 
@@ -63,6 +67,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 现场问题记录与当前场次同库持久化：**刷新页面、重启容器/服务都保留**；归档时随本场快照**一起写入档案并清空当前记录**，重置、手工录入新场、以档案开新场也会清空当前记录（以档案开新场**不复制**档案中的问题记录，原档案保持不变）。记录只增不改不删，**没有单条改、删接口**；待发提示随后被编辑或发出，都不影响已保存的记录快照。
 - 场次对照（`GET /api/compare`）是纯查询：不携带版本号、不加写锁，不修改档案、当前演出或版本号，开场前 / 演出中 / 已完成任意状态都可随时调用。
 - 档案弹窗内的加载（列表 / 详情 / 对照）按视图序号防止过期响应覆盖：进入任一视图或关闭弹窗时序号 +1，请求记录发起时的序号，响应返回时序号不符即丢弃——关闭重开、返回列表、快速切换场次等交错场景下，旧响应不会恢复默认选择、不会把对照页替换成列表、也不会显示已过期的错误。
+- **单控制席**：默认未启用，全部写接口保持旧行为（无需凭据）。`POST /api/control/enable`（仅未启用时）与 `POST /api/control/takeover`（仅已启用时）都携带页面版本号，在锁内检查版本后把「启用/换发凭据 + 版本号 +1」**同一事务**落库——同版本的启用、接管与业务写操作**最多一个成功**，过期版本返回 `409` 及最新状态，失败保留原控制席与版本。
+- 启用后，手工开场、确认、编辑、重排、暂停/恢复、归档、重置、以档案开新场、问题记录**全部写接口**都校验请求头 `X-Control-Token`：**身份检查与业务写入在同一把锁、同一事务内生效**，不会出现"旧请求先通过检查、接管后再落库"的交错；凭据缺失或已被接管替换时返回 `403`（附最新状态）且**数据不变**，旧席即使用最新版本号也不能写。
+- 接管**不改变**提示、进度、暂停标记与档案；凭据只随成功的启用/接管响应返回一次，**状态查询永不包含凭据**；所有查询接口始终可用、无需凭据。凭据与启用状态存于数据库，跨场、刷新、重启服务都保留。
 
 ## 回归测试
 
@@ -74,11 +81,23 @@ node tests/archive-modal.test.js
 
 测试用可控的 fetch（手动决定每个响应的返回顺序与成败）驱动真实的 `app/static/app.js`，覆盖关闭重开、返回列表、快速切换场次时成功 / 空列表 / 失败响应交错到达的场景。
 
+单控制席回归测试：
+
+```bash
+# 后端：启用/接管、403/409、同版本竞争、跨场保留（TestClient + 临时数据库）
+python3 tests/control-seat.test.py
+
+# 前端：凭据保存与请求头、只读禁用、403 后标记更新（纯 Node，不需要启动服务）
+node tests/control-seat.test.js
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 获取当前状态（版本号、暂停标记、当前/下一条、待发与已发列表、现场问题记录 `issues`） |
+| GET | `/api/state` | 获取当前状态（版本号、暂停标记、控制席启用标记 `control_enabled`、当前/下一条、待发与已发列表、现场问题记录 `issues`；**不含凭据**） |
+| POST | `/api/control/enable` | `{version}` 启用单控制席（仅未启用时），成功返回 `control_token` + 最新状态；已启用/版本过期 409 |
+| POST | `/api/control/takeover` | `{version}` 接管控制席（仅已启用时），换发凭据、旧凭据立即失效；未启用/版本过期 409 |
 | POST | `/api/setup` | `{cues:[{number,content}]}` 录入 2～12 条并开始演出 |
 | POST | `/api/confirm` | `{version}` 确认发出当前提示（暂停期间即使版本最新也返回 409） |
 | POST | `/api/pause` | `{version, paused}` 暂停/恢复发出（仅演出中且目标与当前不同才生效，否则 409） |
@@ -91,6 +110,71 @@ node tests/archive-modal.test.js
 | GET | `/api/compare?base={id}&compare={id}` | 对照两场档案的发出节奏（只读）；档案不存在 404 |
 | POST | `/api/archives/{id}/start` | `{version}` 以此档案开新场（仅开场前）；档案不存在 404、校验失败 400、非开场前/版本过期 409 |
 | POST | `/api/reset` | 清空进度，回到设置（不影响档案） |
+
+> 启用控制席后，以上**全部 POST 写接口**（不含 `/api/control/*`）都须携带请求头 `X-Control-Token`；缺失或已失效返回 `403`（附最新状态）且数据不变。未启用时所有接口保持旧行为，无需该请求头。
+
+## 单控制席（请求示例）
+
+默认未启用，写接口无需凭据。任意页面凭当前版本号启用（版本号见页面右上角 `vN` 或 `GET /api/state` 的 `version`）：
+
+```bash
+# 启用单控制席（仅未启用时）；成功返回随机凭据，仅此一次
+curl -X POST http://localhost:8000/api/control/enable \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 5}'
+```
+
+成功（`200`）返回最新状态 + 一次性凭据（`version` 在原版本上 +1）：
+
+```json
+{
+  "version": 6,
+  "status": "live",
+  "paused": false,
+  "control_enabled": true,
+  "control_token": "9dB1xQ…随机凭据…kQ2w"
+}
+```
+
+此后所有写操作都要在请求头带上该凭据（查询接口始终不需要）：
+
+```bash
+# 带凭据的写调用示例：确认发出 / 暂停 / 归档
+curl -X POST http://localhost:8000/api/confirm \
+  -H 'Content-Type: application/json' \
+  -H 'X-Control-Token: 9dB1xQ…随机凭据…kQ2w' \
+  -d '{"version": 6}'
+
+curl -X POST http://localhost:8000/api/pause \
+  -H 'Content-Type: application/json' \
+  -H 'X-Control-Token: 9dB1xQ…随机凭据…kQ2w' \
+  -d '{"version": 7, "paused": true}'
+
+curl -X POST http://localhost:8000/api/archive \
+  -H 'Content-Type: application/json' \
+  -H 'X-Control-Token: 9dB1xQ…随机凭据…kQ2w' \
+  -d '{"version": 8, "name": "10 月 3 日晚场"}'
+```
+
+凭据缺失或已被接管替换时，写请求返回 `403` 且数据不变（`state` 为最新状态）：
+
+```json
+{
+  "error": "forbidden",
+  "message": "本页面不是当前控制席：写操作未生效，可凭最新版本号接管",
+  "state": { "version": 8, "control_enabled": true }
+}
+```
+
+另一页面可凭**当前版本号**主动接管（无需旧凭据）；成功换发新凭据，旧凭据立即失效：
+
+```bash
+curl -X POST http://localhost:8000/api/control/takeover \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 8}'
+```
+
+错误情况（启用与接管）：`409 {"error": "conflict", "message": "操作已过期", "state": {...}}`——已启用时再启用、未启用时接管，或版本号已过期（同版本已有其他操作先生效）；`state` 为最新状态，原控制席与版本不变。
 
 ## 暂停 / 恢复发出（请求示例）
 
@@ -257,13 +341,15 @@ curl 'http://localhost:8000/api/compare?base=1&compare=2'
 
 ```
 app/
-  main.py            # FastAPI 应用与 SQLite 存取（含版本号乐观并发控制、现场问题记录）
+  main.py            # FastAPI 应用与 SQLite 存取（含版本号乐观并发控制、现场问题记录、单控制席）
   static/
     index.html       # 单页界面
     style.css
     app.js
 tests/
   archive-modal.test.js  # 档案弹窗过期响应回归测试（node 直接运行）
+  control-seat.test.py   # 单控制席后端回归测试（TestClient，python3 直接运行）
+  control-seat.test.js   # 单控制席前端回归测试（node 直接运行）
 Dockerfile
 docker-compose.yml
 requirements.txt

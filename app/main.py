@@ -8,16 +8,25 @@
 + 清空提示与问题记录"、以档案开新场的"写入新场提示 + 推进状态"、暂停恢复
 的"暂停标记 + 版本 +1"、问题记录的"插入记录 + 版本 +1"都在同一事务内
 提交，任一步失败整体回滚。
+
+单控制席：默认未启用，所有写操作保持旧行为。任意页面可凭当前版本号启用
+或接管控制席，"启用/接管 + 新凭据 + 版本号 +1"在同一事务内落库；启用后
+全部写操作（手工开场 / 确认 / 编辑 / 重排 / 暂停恢复 / 归档 / 重置 /
+以档案开新场 / 问题记录）须携带当前凭据（请求头 X-Control-Token）。身份
+检查与业务写入在同一把锁、同一事务内生效——缺失或已被接管替换的旧凭据
+返回 403 且数据不变，不会出现"旧请求先通过检查、接管后再落库"的交错。
+凭据只随成功的启用/接管响应返回，状态查询不含凭据；查询接口始终可用。
 """
 import json
 import os
+import secrets
 import sqlite3
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -65,7 +74,9 @@ def init_db() -> None:
                 id      INTEGER PRIMARY KEY CHECK (id = 1),
                 version INTEGER NOT NULL DEFAULT 0,
                 status  TEXT NOT NULL DEFAULT 'setup',  -- setup | live | done
-                paused  INTEGER NOT NULL DEFAULT 0      -- 演出中是否暂停发出
+                paused  INTEGER NOT NULL DEFAULT 0,     -- 演出中是否暂停发出
+                control_enabled INTEGER NOT NULL DEFAULT 0,  -- 是否启用单控制席
+                control_token   TEXT                    -- 当前控制席凭据（未启用为 NULL）
             );
             CREATE TABLE IF NOT EXISTS cues (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,6 +118,13 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE meta ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
             )
+        # 旧库升级：meta 表缺少控制席列时补上，已有数据默认未启用、无凭据。
+        if "control_enabled" not in columns:
+            conn.execute(
+                "ALTER TABLE meta ADD COLUMN control_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        if "control_token" not in columns:
+            conn.execute("ALTER TABLE meta ADD COLUMN control_token TEXT")
         # 旧库升级：archives 表缺少 issues 列时补上，旧档案默认无问题记录。
         archive_columns = {
             r["name"] for r in conn.execute("PRAGMA table_info(archives)")
@@ -140,7 +158,7 @@ def issue_rows(conn: sqlite3.Connection) -> list[dict]:
 
 def build_state(conn: sqlite3.Connection) -> dict:
     meta = conn.execute(
-        "SELECT version, status, paused FROM meta WHERE id = 1"
+        "SELECT version, status, paused, control_enabled FROM meta WHERE id = 1"
     ).fetchone()
     rows = conn.execute(
         "SELECT * FROM cues ORDER BY position ASC, id ASC"
@@ -166,6 +184,8 @@ def build_state(conn: sqlite3.Connection) -> dict:
         "version": meta["version"],
         "status": meta["status"],
         "paused": bool(meta["paused"]),
+        # 是否启用单控制席；凭据永不随状态返回，只在启用/接管成功时下发一次。
+        "control_enabled": bool(meta["control_enabled"]),
         "current": pending_json(pending[0]) if pending else None,
         "next": pending_json(pending[1]) if len(pending) > 1 else None,
         "pending": [pending_json(r) for r in pending],
@@ -184,6 +204,29 @@ def conflict(conn: sqlite3.Connection) -> JSONResponse:
         status_code=409,
         content={"error": "conflict", "message": "操作已过期", "state": build_state(conn)},
     )
+
+
+def control_check(conn: sqlite3.Connection, token: Optional[str]) -> Optional[JSONResponse]:
+    """启用控制席后，写操作须携带当前凭据（请求头 X-Control-Token）。
+
+    必须在写锁内调用：身份检查与随后的业务写入在同一把锁、同一事务内生效，
+    不会出现"旧请求先通过检查、接管后再落库"的交错。凭据缺失或已被接管
+    替换时返回 403（附最新状态），数据不做任何修改；未启用时一律放行，
+    旧调用不变。
+    """
+    meta = conn.execute(
+        "SELECT control_enabled, control_token FROM meta WHERE id = 1"
+    ).fetchone()
+    if meta["control_enabled"] and meta["control_token"] != token:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "forbidden",
+                "message": "本页面不是当前控制席：写操作未生效，可凭最新版本号接管",
+                "state": build_state(conn),
+            },
+        )
+    return None
 
 
 def bad_request(message: str) -> JSONResponse:
@@ -471,8 +514,62 @@ def compare_archives(base: int, compare: int):
     }
 
 
+# ---------------------------------------------------------------- 单控制席
+
+@app.post("/api/control/enable")
+def enable_control(body: VersionedIn):
+    """启用单控制席（仅当前未启用时）。
+
+    任意页面凭当前版本号即可启用；成功则生成随机凭据，"启用标记 + 凭据 +
+    版本号 +1"在同一事务内落库。凭据仅随本响应返回一次（状态查询永远不含
+    凭据），此后所有写操作须携带该凭据（请求头 X-Control-Token）。已启用
+    或版本过期返回 409 及最新状态，原控制席与版本不变；同版本的启用 /
+    接管 / 业务写操作最多一个生效。启用不改变提示、进度、暂停标记与档案。
+    """
+    with lock, db() as conn:
+        meta = conn.execute(
+            "SELECT version, control_enabled FROM meta WHERE id = 1"
+        ).fetchone()
+        if meta["control_enabled"] or body.version != meta["version"]:
+            return conflict(conn)
+        token = secrets.token_urlsafe(32)
+        conn.execute(
+            "UPDATE meta SET control_enabled = 1, control_token = ?, "
+            "version = version + 1 WHERE id = 1",
+            (token,),
+        )
+        state = build_state(conn)
+        state["control_token"] = token  # 凭据仅随成功的启用/接管响应返回
+        return state
+
+
+@app.post("/api/control/takeover")
+def takeover_control(body: VersionedIn):
+    """接管控制席（仅已启用时）：旧凭据立即失效。
+
+    任意页面凭当前版本号即可主动接管；成功则换发随机凭据，"新凭据 + 版本号
+    +1"在同一事务内落库，旧席即使用最新版本号也会因凭据失效被 403 拒绝。
+    未启用或版本过期返回 409 及最新状态，原控制席与版本不变；同版本的
+    接管最多一个成功。接管不改变提示、进度、暂停标记与档案。
+    """
+    with lock, db() as conn:
+        meta = conn.execute(
+            "SELECT version, control_enabled FROM meta WHERE id = 1"
+        ).fetchone()
+        if not meta["control_enabled"] or body.version != meta["version"]:
+            return conflict(conn)
+        token = secrets.token_urlsafe(32)
+        conn.execute(
+            "UPDATE meta SET control_token = ?, version = version + 1 WHERE id = 1",
+            (token,),
+        )
+        state = build_state(conn)
+        state["control_token"] = token  # 凭据仅随成功的启用/接管响应返回
+        return state
+
+
 @app.post("/api/setup")
-def setup(body: SetupIn):
+def setup(body: SetupIn, x_control_token: Optional[str] = Header(default=None)):
     """开场前录入：2~12 条、编号唯一、内容非空。会清空旧进度。"""
     cues = [(c.number, c.content) for c in body.cues]
     error = cue_list_error(cues)
@@ -482,6 +579,9 @@ def setup(body: SetupIn):
     contents = [c.strip() for _, c in cues]
 
     with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 手工录入新场：清空上场遗留的问题记录
         for pos, (number, content) in enumerate(zip(numbers, contents), start=1):
@@ -498,12 +598,15 @@ def setup(body: SetupIn):
 
 
 @app.post("/api/confirm")
-def confirm(body: VersionedIn):
+def confirm(body: VersionedIn, x_control_token: Optional[str] = Header(default=None)):
     """确认发出当前提示：以服务端此刻的内容为准记入已发，并推进一条。
 
     暂停期间即使用最新版本号也返回 409 及最新状态，须先恢复发出。
     """
     with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
         meta = conn.execute(
             "SELECT version, status, paused FROM meta WHERE id = 1"
         ).fetchone()
@@ -538,7 +641,7 @@ def confirm(body: VersionedIn):
 
 
 @app.post("/api/pause")
-def pause(body: PauseIn):
+def pause(body: PauseIn, x_control_token: Optional[str] = Header(default=None)):
     """暂停或恢复发出（仅演出中）。
 
     仅当状态为演出中（live）且目标 paused 与当前不同时生效；暂停标记与
@@ -548,6 +651,9 @@ def pause(body: PauseIn):
     状态；同版本的暂停、恢复、确认、编辑最多一个生效。
     """
     with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
         meta = conn.execute(
             "SELECT version, status, paused FROM meta WHERE id = 1"
         ).fetchone()
@@ -565,9 +671,12 @@ def pause(body: PauseIn):
 
 
 @app.post("/api/edit")
-def edit(body: EditIn):
+def edit(body: EditIn, x_control_token: Optional[str] = Header(default=None)):
     """改写一条尚未发出的提示（内容，可选编号）。"""
     with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
         meta = conn.execute("SELECT version FROM meta WHERE id = 1").fetchone()
         if body.version != meta["version"]:
             return conflict(conn)
@@ -596,9 +705,12 @@ def edit(body: EditIn):
 
 
 @app.post("/api/reorder")
-def reorder(body: ReorderIn):
+def reorder(body: ReorderIn, x_control_token: Optional[str] = Header(default=None)):
     """重排尚未发出的提示：order 必须恰好是全部待发提示的 id。"""
     with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
         meta = conn.execute("SELECT version FROM meta WHERE id = 1").fetchone()
         if body.version != meta["version"]:
             return conflict(conn)
@@ -621,7 +733,7 @@ def reorder(body: ReorderIn):
 
 
 @app.post("/api/issues")
-def add_issue(body: IssueIn):
+def add_issue(body: IssueIn, x_control_token: Optional[str] = Header(default=None)):
     """为当前场次任一提示追加一条现场问题记录。
 
     演出中（含暂停时）或已完成都可记录，开场前（无本场提示）返回 409。
@@ -641,6 +753,9 @@ def add_issue(body: IssueIn):
         )
 
     with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
         meta = conn.execute(
             "SELECT version, status FROM meta WHERE id = 1"
         ).fetchone()
@@ -677,9 +792,12 @@ def add_issue(body: IssueIn):
 
 
 @app.post("/api/reset")
-def reset():
+def reset(x_control_token: Optional[str] = Header(default=None)):
     """清空进度，回到开场前设置。"""
     with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
         conn.execute("DELETE FROM cues")
         conn.execute("DELETE FROM issues")  # 重置一并清空当前场问题记录
         conn.execute(
@@ -690,7 +808,7 @@ def reset():
 
 
 @app.post("/api/archive")
-def archive(body: ArchiveIn):
+def archive(body: ArchiveIn, x_control_token: Optional[str] = Header(default=None)):
     """归档本场并收场。
 
     仅演出中（live）或已完成（done）可归档；携带页面所见版本号。
@@ -704,6 +822,9 @@ def archive(body: ArchiveIn):
         return bad_request("场次名称不能为空")
 
     with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
         meta = conn.execute("SELECT version, status FROM meta WHERE id = 1").fetchone()
         if meta["status"] not in ("live", "done") or body.version != meta["version"]:
             return conflict(conn)
@@ -734,7 +855,11 @@ def archive(body: ArchiveIn):
 
 
 @app.post("/api/archives/{archive_id}/start")
-def start_from_archive(archive_id: int, body: StartFromArchiveIn):
+def start_from_archive(
+    archive_id: int,
+    body: StartFromArchiveIn,
+    x_control_token: Optional[str] = Header(default=None),
+):
     """以档案开新场。
 
     按档案已发顺序取编号与内容快照，再接待发顺序的编号与内容，全部作为
@@ -761,6 +886,9 @@ def start_from_archive(archive_id: int, body: StartFromArchiveIn):
     contents = [c.strip() for _, c in cues]
 
     with lock, db() as conn:
+        forbidden = control_check(conn, x_control_token)
+        if forbidden:
+            return forbidden
         meta = conn.execute("SELECT version, status FROM meta WHERE id = 1").fetchone()
         if meta["status"] != "setup" or body.version != meta["version"]:
             return conflict(conn)

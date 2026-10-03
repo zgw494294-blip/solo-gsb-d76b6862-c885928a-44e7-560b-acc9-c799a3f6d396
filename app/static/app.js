@@ -8,6 +8,52 @@ let editingIssueId = null; // 正在追加现场问题记录的提示 id（已�
 let busy = false;     // 有请求在途时禁用确认按钮，防止重复点击
 let prevStatus = null; // 上一帧状态，用于识别回到开场前的切换
 
+/* ---------------------------------------------------------------- 单控制席
+ * 启用后所有写操作须携带本标签页保存的凭据（请求头 X-Control-Token）。
+ * 凭据存 sessionStorage：刷新保留、标签页之间各自独立；启用状态与凭据在
+ * 服务端数据库中，跨场、刷新页面、重启服务都继续有效。 */
+
+const CONTROL_TOKEN_KEY = "cueControlToken";
+let controlToken = loadControlToken();
+
+function loadControlToken() {
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      return sessionStorage.getItem(CONTROL_TOKEN_KEY) || null;
+    }
+  } catch (err) { /* 存储不可用时按无凭据处理 */ }
+  return null;
+}
+
+function saveControlToken(token) {
+  controlToken = token || null;
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      if (controlToken) sessionStorage.setItem(CONTROL_TOKEN_KEY, controlToken);
+      else sessionStorage.removeItem(CONTROL_TOKEN_KEY);
+    }
+  } catch (err) { /* 存储不可用时仅保留在内存中 */ }
+}
+
+/* 本页是否具备控制资格：未启用控制席时任何页面可写；启用后须持有当前凭据。 */
+function canWrite() {
+  return !!state && (!state.control_enabled || !!controlToken);
+}
+
+function apiHeaders() {
+  const headers = { "Content-Type": "application/json" };
+  if (controlToken) headers["X-Control-Token"] = controlToken;
+  return headers;
+}
+
+/* 403：凭据缺失或已被接管替换——清除本页控制标记并刷新为最新状态。 */
+function handleForbidden(data) {
+  saveControlToken(null);
+  if (data && data.state) applyState(data.state);
+  else render();
+  toast((data && data.message) || "本页面不是当前控制席，写操作未生效");
+}
+
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 
@@ -34,10 +80,15 @@ async function api(path, body) {
   try {
     const res = await fetch(path, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: apiHeaders(),
       body: JSON.stringify(body),
     });
     const data = await res.json();
+    if (res.status === 403) {
+      // 凭据缺失或已被接管：清除本页控制标记，刷新为最新状态
+      handleForbidden(data);
+      return null;
+    }
     if (res.status === 409) {
       // 操作过期：同版本已有其他先生效，用最新状态刷新页面
       applyState(data.state);
@@ -73,13 +124,84 @@ function applyState(s) {
 }
 
 function updateBusy() {
+  const writable = canWrite(); // 非控制席禁用一切写操作（仍可接管）
   const btn = $("#confirm-btn");
   // 暂停期间禁用确认按钮（服务端同样会拒绝并返回 409）
-  if (btn) btn.disabled = busy || !state || !state.current || state.paused;
+  if (btn) btn.disabled = busy || !writable || !state || !state.current || state.paused;
   const archiveBtn = $("#archive-btn");
-  if (archiveBtn) archiveBtn.disabled = busy || archiveSubmitting || !state || state.status === "setup";
+  if (archiveBtn) archiveBtn.disabled = busy || !writable || archiveSubmitting || !state || state.status === "setup";
   const pauseBtn = $("#pause-btn");
-  if (pauseBtn) pauseBtn.disabled = busy || !state || state.status !== "live";
+  if (pauseBtn) pauseBtn.disabled = busy || !writable || !state || state.status !== "live";
+  const resetBtn = $("#reset-btn");
+  if (resetBtn) resetBtn.disabled = busy || !writable;
+  const startBtn = $("#start-show");
+  if (startBtn) startBtn.disabled = busy || !writable;
+  const controlBtn = $("#control-btn");
+  if (controlBtn) controlBtn.disabled = busy;
+}
+
+/* 页头控制席标记：未启用 / 本页控制 / 他人控制（本页只读，可接管）。 */
+function renderControl() {
+  const badge = $("#control-badge");
+  const btn = $("#control-btn");
+  if (!badge || !btn) return;
+  if (!state) {
+    badge.textContent = "控制席：…";
+    badge.className = "control-badge off";
+    btn.classList.add("hidden");
+    return;
+  }
+  if (!state.control_enabled) {
+    badge.textContent = "控制席：未启用";
+    badge.className = "control-badge off";
+    btn.textContent = "启用控制席";
+    btn.classList.remove("hidden");
+  } else if (controlToken) {
+    badge.textContent = "控制席：本页 ✓";
+    badge.className = "control-badge own";
+    btn.classList.add("hidden");
+  } else {
+    badge.textContent = "控制席：他人 · 本页只读";
+    badge.className = "control-badge other";
+    btn.textContent = "接管控制席";
+    btn.classList.remove("hidden");
+  }
+}
+
+/* 启用或接管控制席：凭当前版本号，成功返回的随机凭据只保存在本标签页。 */
+async function claimControl(enabling) {
+  busy = true;
+  updateBusy();
+  try {
+    const res = await fetch(enabling ? "/api/control/enable" : "/api/control/takeover", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: JSON.stringify({ version: state.version }),
+    });
+    const data = await res.json();
+    if (res.status === 409) {
+      // 同版本已有其他操作先生效（含他人抢先启用/接管），刷新为最新状态
+      applyState(data.state);
+      toast("操作未生效：已有人先操作，页面已刷新为最新状态");
+      return;
+    }
+    if (res.status === 403) { handleForbidden(data); return; }
+    if (!res.ok) {
+      toast(data.error || "请求失败");
+      return;
+    }
+    saveControlToken(data.control_token); // 凭据仅保存在本标签页
+    delete data.control_token;            // 不留在页面状态里
+    applyState(data);
+    toast(enabling
+      ? "已启用控制席：本页面获得控制资格，其他页面变为只读"
+      : "已接管控制席：原控制席凭据已失效");
+  } catch (err) {
+    toast("网络错误：" + err.message);
+  } finally {
+    busy = false;
+    updateBusy();
+  }
 }
 
 /* ---------------------------------------------------------------- 档案库 */
@@ -153,7 +275,7 @@ async function loadArchiveList() {
   }
   if (viewSeq !== archivesViewSeq) return; // 已离开列表或弹窗已关闭，丢弃过期响应
   const items = data.archives || [];
-  const canArchive = state && state.status !== "setup";
+  const canArchive = state && state.status !== "setup" && canWrite();
   if (!items.length) {
     $("#archives-body").innerHTML = `
       <p class="empty">还没有归档档案。演出结束或提前收场后，可点击「归档本场」保存回看。</p>
@@ -195,7 +317,7 @@ async function loadArchiveDetail(id) {
   if (viewSeq !== archivesViewSeq) return; // 已离开详情或弹窗已关闭，丢弃过期响应
   currentDetail = a;
   const total = a.issued.length + a.pending.length;
-  const canStart = state && state.status === "setup";
+  const canStart = state && state.status === "setup" && canWrite();
   $("#archives-body").innerHTML = `
     <div class="archive-detail-head">
       <div class="archive-detail-name">${escapeHtml(a.name)}</div>
@@ -238,13 +360,19 @@ async function loadArchiveDetail(id) {
     <p class="hint">
       ${canStart
         ? `将按<b>已发顺序</b>取 ${a.issued.length} 条编号与内容快照，再接<b>待发顺序</b>的 ${a.pending.length} 条，共 ${total} 条全部作为新场待发提示；不继承发出时间或进度，原档案保持不变。`
-        : "仅开场前（设置页）可以此开新场；当前场次进行中，请先收场或重新开始。"}
+        : !state || state.status !== "setup"
+          ? "仅开场前（设置页）可以此开新场；当前场次进行中，请先收场或重新开始。"
+          : "本页面不是当前控制席：接管后方可以此开新场。"}
     </p>`;
 }
 
 function openArchiveForm() {
   if (!state || state.status === "setup") {
     toast("开场前没有可归档的场次");
+    return;
+  }
+  if (!canWrite()) {
+    toast("本页面不是当前控制席：可接管后再归档");
     return;
   }
   archivesViewSeq++; // 进入归档表单视图：列表/对照的在途请求失效
@@ -274,10 +402,15 @@ async function submitArchive() {
   try {
     const res = await fetch("/api/archive", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: apiHeaders(),
       body: JSON.stringify({ version: state.version, name }),
     });
     const data = await res.json();
+    if (res.status === 403) {
+      handleForbidden(data);
+      closeArchivesModal();
+      return;
+    }
     if (res.status === 409) {
       applyState(data.state);
       closeArchivesModal();
@@ -323,10 +456,15 @@ async function submitStartFromArchive() {
   try {
     const res = await fetch("/api/archives/" + encodeURIComponent(a.id) + "/start", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: apiHeaders(),
       body: JSON.stringify({ version: state.version }),
     });
     const data = await res.json();
+    if (res.status === 403) {
+      handleForbidden(data);
+      closeArchivesModal();
+      return;
+    }
     if (res.status === 409) {
       applyState(data.state);
       closeArchivesModal();
@@ -507,6 +645,7 @@ function renderCompareResult(data) {
 function render() {
   if (!state) return;
   $("#version-badge").textContent = "v" + state.version;
+  renderControl(); // 刷新或收到 403 后都会走到这里，标记随之更新
 
   const inSetup = state.status === "setup";
   $("#setup-view").classList.toggle("hidden", !inSetup);
@@ -553,6 +692,7 @@ function render() {
 function renderPending() {
   const ul = $("#pending-list");
   const items = state.pending;
+  const writable = canWrite(); // 非控制席：改写 / 记问题 / 重排按钮全部禁用
   if (!items.length) {
     ul.innerHTML = `<li class="empty">全部提示已发出</li>`;
     return;
@@ -565,7 +705,7 @@ function renderPending() {
       return `<li class="pending-item editing" data-id="${c.id}">
         <input class="num-input" value="${escapeHtml(c.number)}" maxlength="30" aria-label="编号">
         <span class="ops">
-          <button class="primary" data-action="save-edit" data-id="${c.id}">保存</button>
+          <button class="primary" data-action="save-edit" data-id="${c.id}" ${writable ? "" : "disabled"}>保存</button>
           <button data-action="cancel-edit">取消</button>
         </span>
         <textarea class="content-input" rows="2" aria-label="内容">${escapeHtml(c.content)}</textarea>
@@ -578,10 +718,10 @@ function renderPending() {
       <span class="content">${escapeHtml(c.content)}</span>
       ${tag}
       <span class="ops">
-        <button data-action="edit" data-id="${c.id}" title="改写">✎</button>
-        <button data-action="add-issue" data-id="${c.id}" title="记现场问题">⚠</button>
-        <button data-action="up" data-idx="${i}" ${i === 0 ? "disabled" : ""} title="上移">↑</button>
-        <button data-action="down" data-idx="${i}" ${i === items.length - 1 ? "disabled" : ""} title="下移">↓</button>
+        <button data-action="edit" data-id="${c.id}" title="改写" ${writable ? "" : "disabled"}>✎</button>
+        <button data-action="add-issue" data-id="${c.id}" title="记现场问题" ${writable ? "" : "disabled"}>⚠</button>
+        <button data-action="up" data-idx="${i}" ${i === 0 || !writable ? "disabled" : ""} title="上移">↑</button>
+        <button data-action="down" data-idx="${i}" ${i === items.length - 1 || !writable ? "disabled" : ""} title="下移">↓</button>
       </span>
     </li>`;
   }).join("");
@@ -589,6 +729,7 @@ function renderPending() {
 
 function renderIssued() {
   const ul = $("#issued-list");
+  const writable = canWrite();
   if (!state.issued.length) {
     ul.innerHTML = `<li class="empty">尚无已发记录</li>`;
     return;
@@ -601,7 +742,7 @@ function renderIssued() {
       <span class="content">${escapeHtml(c.content)}</span>
       <span class="time">${t}</span>
       <span class="ops">
-        <button data-action="add-issue" data-id="${c.id}" title="记现场问题">⚠</button>
+        <button data-action="add-issue" data-id="${c.id}" title="记现场问题" ${writable ? "" : "disabled"}>⚠</button>
       </span>
     </li>`;
   }).join("");
@@ -617,7 +758,7 @@ function issueEditHtml(c, cueStatus) {
     <span class="badge">${escapeHtml(c.number)}</span>
     ${statusTag}
     <span class="ops">
-      <button class="primary" data-action="save-issue" data-id="${c.id}">保存记录</button>
+      <button class="primary" data-action="save-issue" data-id="${c.id}" ${canWrite() ? "" : "disabled"}>保存记录</button>
       <button data-action="cancel-issue">取消</button>
     </span>
     <textarea class="issue-input" rows="2" maxlength="200"
@@ -781,6 +922,17 @@ $("#pause-btn").addEventListener("click", () => {
   if (!state || state.status !== "live") return;
   // 提交目标暂停状态与页面所见版本号；同版本的其他操作先生效时会拿到 409
   api("/api/pause", { version: state.version, paused: !state.paused });
+});
+
+$("#control-btn").addEventListener("click", () => {
+  if (!state || busy) return;
+  if (!state.control_enabled) {
+    claimControl(true); // 未启用：本页启用并成为控制席
+    return;
+  }
+  if (controlToken) return; // 本页已是控制席（按钮此时隐藏，双保险）
+  if (!confirm("接管后原控制席的凭据立即失效，其后续写操作将被拒绝（对方可凭最新版本号再次接管）。确定接管控制席吗？")) return;
+  claimControl(false);
 });
 
 /* ---------------------------------------------------------------- 档案事件 */
