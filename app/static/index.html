@@ -10,10 +10,14 @@
   <header>
     <h1>🎭 舞台提示执行台</h1>
     <div class="header-ops">
+      <span id="control-badge" class="control-badge" title="本页控制资格">控制席…</span>
+      <button id="control-btn" class="ghost hidden">启用控制席</button>
       <button id="archives-btn" class="ghost">📚 档案库</button>
       <span id="version-badge" title="状态版本号">v0</span>
     </div>
   </header>
+
+  <div id="readonly-banner" class="hidden">👀 本页为旁观席：写操作已禁用；可点击右上角「接管控制席」获得控制资格。</div>
 
   <div id="toast" role="status"></div>
 
